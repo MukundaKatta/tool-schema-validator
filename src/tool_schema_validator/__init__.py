@@ -1,188 +1,128 @@
-"""tool-schema-validator: validate tool JSON schemas before sending to LLMs."""
+"""
+tool-schema-validator: Validate tool schemas against Anthropic / OpenAI / Gemini specs.
+"""
+from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any, Optional
+
+
+@dataclass
+class ValidationIssue:
+    field: str
+    reason: str
+    severity: str = "error"  # "error" | "warning"
+
+    def __str__(self) -> str:
+        return f"[{self.severity}] {self.field}: {self.reason}"
 
 
 @dataclass
 class ValidationResult:
-    valid: bool
-    errors: list[str] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
+    schema: dict[str, Any]
+    issues: list[ValidationIssue] = field(default_factory=list)
+    provider: str = ""
+
+    @property
+    def valid(self) -> bool:
+        return not any(i.severity == "error" for i in self.issues)
+
+    @property
+    def errors(self) -> list[ValidationIssue]:
+        return [i for i in self.issues if i.severity == "error"]
+
+    @property
+    def warnings(self) -> list[ValidationIssue]:
+        return [i for i in self.issues if i.severity == "warning"]
+
+    def __bool__(self) -> bool:
+        return self.valid
 
 
-def validate_anthropic(schema: dict) -> ValidationResult:
-    """
-    Validate an Anthropic tool schema.
+def _check_common(schema: dict[str, Any]) -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
+    if "name" not in schema:
+        issues.append(ValidationIssue("name", "Missing required field 'name'"))
+    elif not isinstance(schema["name"], str) or not schema["name"]:
+        issues.append(ValidationIssue("name", "Field 'name' must be a non-empty string"))
+    if "description" not in schema:
+        issues.append(ValidationIssue("description", "Missing 'description'", severity="warning"))
+    return issues
 
-    Rules:
-    - Must be a dict
-    - Must have "name": str, non-empty, max 64 chars, no spaces
-    - Must have "description": str, non-empty (warning if missing/empty)
-    - Must have "input_schema": dict with "type": "object"
-    - input_schema should have "properties": dict (warning if missing)
-    - input_schema must NOT have anyOf/oneOf/allOf at top level
-    """
-    errors: list[str] = []
-    warnings: list[str] = []
 
-    if not isinstance(schema, dict):
-        return ValidationResult(valid=False, errors=["schema must be a dict"])
-
-    # name checks
-    name = schema.get("name")
-    if not isinstance(name, str) or not name:
-        errors.append("'name' is required and must be a non-empty string")
-    else:
-        if " " in name:
-            errors.append("'name' must not contain spaces")
-        if len(name) > 64:
-            errors.append("'name' must be 64 characters or fewer")
-
-    # description checks
-    desc = schema.get("description")
-    if not isinstance(desc, str) or not desc:
-        warnings.append("'description' is recommended and should be a non-empty string")
-
-    # input_schema checks
-    input_schema = schema.get("input_schema")
+def _check_input_schema(input_schema: Any, prefix: str = "input_schema") -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
     if not isinstance(input_schema, dict):
-        errors.append("'input_schema' is required and must be a dict")
+        issues.append(ValidationIssue(prefix, "Must be a JSON object (dict)"))
+        return issues
+    if input_schema.get("type") != "object":
+        issues.append(ValidationIssue(f"{prefix}.type", "Must be 'object'"))
+    if "properties" not in input_schema:
+        issues.append(ValidationIssue(f"{prefix}.properties", "Missing 'properties' field"))
+    elif not isinstance(input_schema["properties"], dict):
+        issues.append(ValidationIssue(f"{prefix}.properties", "Must be a dict"))
     else:
-        if input_schema.get("type") != "object":
-            errors.append("'input_schema.type' must be \"object\"")
-        for banned in ("anyOf", "oneOf", "allOf"):
-            if banned in input_schema:
-                errors.append(f"'input_schema' must not contain '{banned}'")
-        if not isinstance(input_schema.get("properties"), dict):
-            warnings.append("'input_schema.properties' is recommended and should be a dict")
-
-    valid = len(errors) == 0
-    return ValidationResult(valid=valid, errors=errors, warnings=warnings)
-
-
-def validate_openai(schema: dict) -> ValidationResult:
-    """
-    Validate an OpenAI tool schema.
-
-    Rules:
-    - Must be a dict
-    - Must have "type": "function"
-    - Must have "function": dict
-    - function must have "name": str, non-empty
-    - function must have "description": str (warning if missing)
-    - function must have "parameters": dict with "type": "object"
-    - parameters should have "properties": dict (warning if missing)
-    """
-    errors: list[str] = []
-    warnings: list[str] = []
-
-    if not isinstance(schema, dict):
-        return ValidationResult(valid=False, errors=["schema must be a dict"])
-
-    # type check
-    if schema.get("type") != "function":
-        errors.append("'type' must be \"function\"")
-
-    # function block
-    fn = schema.get("function")
-    if not isinstance(fn, dict):
-        errors.append("'function' is required and must be a dict")
-    else:
-        name = fn.get("name")
-        if not isinstance(name, str) or not name:
-            errors.append("'function.name' is required and must be a non-empty string")
-
-        desc = fn.get("description")
-        if not isinstance(desc, str) or not desc:
-            warnings.append(
-                "'function.description' is recommended and should be a non-empty string"
-            )
-
-        params = fn.get("parameters")
-        if not isinstance(params, dict):
-            errors.append("'function.parameters' is required and must be a dict")
-        else:
-            if params.get("type") != "object":
-                errors.append("'function.parameters.type' must be \"object\"")
-            if not isinstance(params.get("properties"), dict):
-                warnings.append(
-                    "'function.parameters.properties' is recommended and should be a dict"
-                )
-
-    valid = len(errors) == 0
-    return ValidationResult(valid=valid, errors=errors, warnings=warnings)
-
-
-def validate_gemini(schema: dict) -> ValidationResult:
-    """
-    Validate a Gemini function declaration schema.
-
-    Rules:
-    - Must be a dict
-    - Must have "name": str, non-empty
-    - Must have "description": str (warning if missing)
-    - Must have "parameters": dict with "type": "OBJECT" (Gemini uses uppercase)
-    - parameters should have "properties": dict (warning if missing)
-    """
-    errors: list[str] = []
-    warnings: list[str] = []
-
-    if not isinstance(schema, dict):
-        return ValidationResult(valid=False, errors=["schema must be a dict"])
-
-    # name check
-    name = schema.get("name")
-    if not isinstance(name, str) or not name:
-        errors.append("'name' is required and must be a non-empty string")
-
-    # description check
-    desc = schema.get("description")
-    if not isinstance(desc, str) or not desc:
-        warnings.append("'description' is recommended and should be a non-empty string")
-
-    # parameters check
-    params = schema.get("parameters")
-    if not isinstance(params, dict):
-        errors.append("'parameters' is required and must be a dict")
-    else:
-        # Gemini requires uppercase "OBJECT", not lowercase "object"
-        if params.get("type") != "OBJECT":
-            errors.append("'parameters.type' must be \"OBJECT\" (Gemini uses uppercase)")
-        if not isinstance(params.get("properties"), dict):
-            warnings.append("'parameters.properties' is recommended and should be a dict")
-
-    valid = len(errors) == 0
-    return ValidationResult(valid=valid, errors=errors, warnings=warnings)
+        for param_name, param_schema in input_schema["properties"].items():
+            if not isinstance(param_schema, dict):
+                issues.append(ValidationIssue(f"{prefix}.properties.{param_name}", "Parameter schema must be a dict"))
+                continue
+            if "type" not in param_schema:
+                issues.append(ValidationIssue(f"{prefix}.properties.{param_name}.type",
+                                               "Missing 'type' field", severity="warning"))
+    return issues
 
 
 class SchemaValidator:
-    """Multi-provider tool schema validator."""
+    """
+    Validate tool schemas against provider specs.
 
-    def __init__(self) -> None:
-        self._providers: dict[str, object] = {
-            "anthropic": validate_anthropic,
-            "openai": validate_openai,
-            "gemini": validate_gemini,
+    Usage::
+
+        validator = SchemaValidator()
+        result = validator.validate_anthropic({"name": "search", "description": "...",
+                                               "input_schema": {"type": "object", "properties": {...}}})
+        assert result.valid
+        results = validator.validate_all([schema1, schema2])
+    """
+
+    def validate_anthropic(self, schema: dict[str, Any]) -> ValidationResult:
+        issues = _check_common(schema)
+        if "input_schema" not in schema:
+            issues.append(ValidationIssue("input_schema", "Missing required field 'input_schema'"))
+        else:
+            issues.extend(_check_input_schema(schema["input_schema"]))
+        return ValidationResult(schema=schema, issues=issues, provider="anthropic")
+
+    def validate_openai(self, schema: dict[str, Any]) -> ValidationResult:
+        issues: list[ValidationIssue] = []
+        if schema.get("type") != "function":
+            issues.append(ValidationIssue("type", "Must be 'function' for OpenAI format"))
+        fn = schema.get("function", {})
+        if not isinstance(fn, dict):
+            issues.append(ValidationIssue("function", "Must be a dict"))
+        else:
+            issues.extend(_check_common(fn))
+            if "parameters" in fn:
+                issues.extend(_check_input_schema(fn["parameters"], prefix="function.parameters"))
+        return ValidationResult(schema=schema, issues=issues, provider="openai")
+
+    def validate_gemini(self, schema: dict[str, Any]) -> ValidationResult:
+        issues = _check_common(schema)
+        if "parameters" in schema:
+            issues.extend(_check_input_schema(schema["parameters"]))
+        return ValidationResult(schema=schema, issues=issues, provider="gemini")
+
+    def validate_all(self, schemas: list[dict[str, Any]], provider: str = "anthropic") -> list[ValidationResult]:
+        dispatch = {
+            "anthropic": self.validate_anthropic,
+            "openai": self.validate_openai,
+            "gemini": self.validate_gemini,
         }
+        fn = dispatch.get(provider, self.validate_anthropic)
+        return [fn(s) for s in schemas]
 
-    def register_provider(self, name: str, validate_fn) -> None:
-        """Register a custom provider. validate_fn(schema: dict) -> ValidationResult."""
-        self._providers[name] = validate_fn
+    def all_valid(self, schemas: list[dict[str, Any]], provider: str = "anthropic") -> bool:
+        return all(r.valid for r in self.validate_all(schemas, provider=provider))
 
-    def validate(self, schema: dict, provider: str) -> ValidationResult:
-        """Validate schema against a named provider. Raises ValueError if provider unknown."""
-        if provider not in self._providers:
-            registered = sorted(self._providers)
-            raise ValueError(
-                f"Unknown provider {provider!r}. Registered providers: {registered}"
-            )
-        fn = self._providers[provider]
-        return fn(schema)  # type: ignore[operator]
 
-    def validate_all(self, schema: dict) -> dict[str, ValidationResult]:
-        """Run all registered providers and return {provider_name: ValidationResult}."""
-        return {name: fn(schema) for name, fn in self._providers.items()}  # type: ignore[operator]
-
-    def providers(self) -> list[str]:
-        """Return sorted list of registered provider names."""
-        return sorted(self._providers)
+__all__ = ["SchemaValidator", "ValidationResult", "ValidationIssue"]
